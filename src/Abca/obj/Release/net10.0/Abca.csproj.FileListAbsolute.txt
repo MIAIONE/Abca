@@ -1,0 +1,12 @@
+D:\work\Code\ActorModelNetwork\src\Abca\bin\Release\net10.0\Abca.deps.json
+D:\work\Code\ActorModelNetwork\src\Abca\bin\Release\net10.0\Abca.dll
+D:\work\Code\ActorModelNetwork\src\Abca\bin\Release\net10.0\Abca.pdb
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.csproj.AssemblyReference.cache
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.GeneratedMSBuildEditorConfig.editorconfig
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.AssemblyInfoInputs.cache
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.AssemblyInfo.cs
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.csproj.CoreCompileInputs.cache
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.dll
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\refint\Abca.dll
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\Abca.pdb
+D:\work\Code\ActorModelNetwork\src\Abca\obj\Release\net10.0\ref\Abca.dll

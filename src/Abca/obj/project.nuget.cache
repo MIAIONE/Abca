@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "HSh3zIjK4VY=",
+  "success": true,
+  "projectFilePath": "D:\\work\\Code\\ActorModelNetwork\\src\\Abca\\Abca.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\19138\\.nuget\\packages\\ilgpu\\1.5.3\\ilgpu.1.5.3.nupkg.sha512",
+    "C:\\Users\\19138\\.nuget\\packages\\system.numerics.tensors\\10.0.2\\system.numerics.tensors.10.0.2.nupkg.sha512"
+  ],
+  "logs": []
+}
