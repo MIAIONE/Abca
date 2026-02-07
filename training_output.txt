@@ -1,0 +1,45 @@
+鈺斺晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晽
+鈺?   ABCA - Asynchronous Bio-inspired Computing Architecture                  鈺?
+鈺?   MNIST Handwritten Digit Recognition                                      鈺?
+鈺犫晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨暎
+鈺? Learning: Spike Encoding 鈫?Competitive Hebbian 鈫?Reward-Modulated Hebbian  鈺?
+鈺? Three-factor rule: 螖W = reward 脳 pre_activity 脳 post_activity              鈺?
+鈺? NO backpropagation. NO softmax training. NO gradient. All learning local.  鈺?
+鈺氣晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨暆
+
+[1/5] Loading MNIST dataset...
+  Training samples: 60,000
+  Test samples:     10,000
+
+[GPU] Device:     NVIDIA GeForce RTX 5070 Laptop GPU
+[GPU] Type:       Cuda
+[GPU] Accelerated: Yes (GPU)
+
+[2/5] Creating ABCA network...
+  Hidden cells:     1600
+  Top-K winners:    80 (5% of hidden)
+  Input encoding:   Rate coding
+  Compute backend:  GPU (NVIDIA GeForce RTX 5070 Laptop GPU)
+  Synaptic scale:   5
+  Hidden LR:        0.01
+  Output LR:        0.01
+  Epochs:           30
+  Seed:             42
+
+[3/5] Training...
+  Phase 1: Unsupervised Hebbian feature learning    (6 epochs)
+  Phase 2: Full co-adaptive learning (both layers)  (12 epochs)
+  Phase 3: Output consolidation (hidden frozen)     (12 epochs)
+鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+[unsup] Epoch   1 | Train:   9.17% loss=  0.0000 | Test:  10.65% loss=  0.0000 |  13.20s (    4547 samples/s)
+[unsup] Epoch   2 | Train:   9.32% loss=  0.0000 | Test:   9.12% loss=  0.0000 |  13.41s (    4473 samples/s)
+[unsup] Epoch   3 | Train:   9.32% loss=  0.0000 | Test:  10.93% loss=  0.0000 |  13.29s (    4515 samples/s)
+[unsup] Epoch   4 | Train:   9.77% loss=  0.0000 | Test:   7.70% loss=  0.0000 |  15.10s (    3973 samples/s)
+[unsup] Epoch   5 | Train:  10.12% loss=  0.0000 | Test:   4.44% loss=  0.0000 |  18.43s (    3255 samples/s)
+[unsup] Epoch   6 | Train:   8.38% loss=  0.0000 | Test:   9.22% loss=  0.0000 |  18.84s (    3185 samples/s)
+[full ] Epoch   7 | Train:  73.88% loss=  0.0000 | Test:  75.89% loss=  0.0000 |  19.20s (    3126 samples/s)
+[full ] Epoch   8 | Train:  73.98% loss=  0.0000 | Test:  76.64% loss=  0.0000 |  19.33s (    3104 samples/s)
+[full ] Epoch   9 | Train:  74.24% loss=  0.0000 | Test:  74.81% loss=  0.0000 |  19.46s (    3084 samples/s)
+[full ] Epoch  10 | Train:  74.50% loss=  0.0000 | Test:  75.71% loss=  0.0000 |  19.66s (    3051 samples/s)
+[full ] Epoch  11 | Train:  74.56% loss=  0.0000 | Test:  77.24% loss=  0.0000 |  19.79s (    3032 samples/s)
+[full ] Epoch  12 | Train:  74.69% loss=  0.0000 | Test:  75.18% loss=  0.0000 |  19.85s (    3023 samples/s)

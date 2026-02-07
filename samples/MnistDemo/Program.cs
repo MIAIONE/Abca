@@ -26,8 +26,8 @@ const string ModelPath = "abca_mnist.bin";
 //  Parse command-line arguments
 // ─────────────────────────────────────────────────────────────────────────────
 int epochs = GetArgInt(args, "--epochs", 30);
-int hiddenSize = GetArgInt(args, "--hidden", 800);
-float topKFraction = GetArgFloat(args, "--topk", 0.1f);
+int hiddenSize = GetArgInt(args, "--hidden", 1600);
+float topKFraction = GetArgFloat(args, "--topk", 0.05f);
 int seed = GetArgInt(args, "--seed", 42);
 
 Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════════╗");
@@ -85,7 +85,7 @@ var config = new NetworkConfig
     HomeostasisDecay = 0.999f,
     UseRateCoding = true,            // Rate coding: firing rate ∝ intensity (bio)
     SpikeThreshold = 0f,
-    SynapticScaleTarget = 0f,        // Disabled: critical period → higher plasticity
+    SynapticScaleTarget = 5f,        // Mild: prevents unbounded weight growth (bio: synaptic receptor density limit)
     Epochs = epochs,
     Seed = seed
 };
@@ -114,8 +114,8 @@ Console.WriteLine();
 //    3. After learning, plasticity decreases (memory consolidation)
 // ─────────────────────────────────────────────────────────────────────────────
 int warmupEpochs = Math.Max(2, epochs / 5);       // 20% unsupervised
-int fullEpochs = Math.Max(1, epochs * 3 / 5);     // 60% full (both layers plastic)
-int consolidateEpochs = epochs - warmupEpochs - fullEpochs; // 20% consolidation
+int fullEpochs = Math.Max(1, epochs * 2 / 5);     // 40% full (both layers plastic)
+int consolidateEpochs = epochs - warmupEpochs - fullEpochs; // 40% consolidation
 
 Console.WriteLine("[3/5] Training...");
 Console.WriteLine($"  Phase 1: Unsupervised Hebbian feature learning    ({warmupEpochs} epochs)");
@@ -149,6 +149,21 @@ for (int epoch = 1; epoch <= epochs; epoch++)
     else
         mode = TrainingMode.OutputOnly;           // Memory consolidation
 
+    // ── Learning rate schedule (bio-justified) ───────────────────────
+    // Bio: critical period plasticity is high, mature cortex plasticity decreases.
+    // This mimics the gradual reduction in NMDA receptor expression with age.
+    float epochProgress = (float)epoch / epochs;                        // 0→1
+    float lrScale = 1.0f / (1.0f + 3.0f * epochProgress);             // 1.0 → 0.25 over training
+
+    // In Full mode, reduce hidden LR further to prevent catastrophic forgetting
+    // Bio: mature receptive fields are more stable than developing ones
+    float hiddenLrScale = mode == TrainingMode.Full ? lrScale * 0.3f : lrScale;
+
+    // Apply scaled learning rates
+    network.SetLearningRates(
+        config.HiddenLearningRate * hiddenLrScale,
+        config.OutputLearningRate * lrScale);
+
     // Shuffle training data (Fisher-Yates)
     for (int i = trainCount - 1; i > 0; i--)
     {
@@ -179,7 +194,7 @@ for (int epoch = 1; epoch <= epochs; epoch++)
     sw.Stop();
     float sps = trainCount / (float)sw.Elapsed.TotalSeconds;
 
-    string phaseTag = epoch <= warmupEpochs ? "[unsup]" 
+    string phaseTag = epoch <= warmupEpochs ? "[unsup]"
         : epoch <= warmupEpochs + fullEpochs ? "[full ]" : "[cnsld]";
 
     var metrics = new EpochMetrics

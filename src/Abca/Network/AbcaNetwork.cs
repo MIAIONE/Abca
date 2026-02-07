@@ -69,6 +69,10 @@ public sealed class AbcaNetwork : IDisposable
     private readonly NativeBuffer<float> _avgActivity;      // running avg activity per hidden cell
     private int _step;                                       // training step counter
 
+    // ── Runtime learning rates (can be adjusted for LR schedule) ──────
+    private float _currentHiddenLR;
+    private float _currentOutputLR;
+
     // ── Optional GPU acceleration ────────────────────────────────────────
     private readonly GpuAccelerator? _gpu;
     private bool _gpuEnabled;
@@ -98,6 +102,19 @@ public sealed class AbcaNetwork : IDisposable
         set => _gpuEnabled = value;
     }
 
+    /// <summary>
+    /// Adjusts runtime learning rates (for LR schedule / decay).
+    /// Bio-rationale: NMDA receptor expression decreases with age,
+    /// reducing synaptic plasticity from critical period to maturity.
+    /// </summary>
+    /// <param name="hiddenLR">Current hidden layer learning rate.</param>
+    /// <param name="outputLR">Current output layer learning rate.</param>
+    public void SetLearningRates(float hiddenLR, float outputLR)
+    {
+        _currentHiddenLR = hiddenLR;
+        _currentOutputLR = outputLR;
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     //  Construction
     // ─────────────────────────────────────────────────────────────────────
@@ -117,6 +134,10 @@ public sealed class AbcaNetwork : IDisposable
 
         _hiddenLayer = new CellLayer(config.InputSize, config.HiddenSize, rng);
         _outputLayer = new CellLayer(config.HiddenSize, config.OutputSize, rng);
+
+        // Runtime learning rates (default from config)
+        _currentHiddenLR = config.HiddenLearningRate;
+        _currentOutputLR = config.OutputLearningRate;
 
         // Scratch buffers
         _inputEncoded = new NativeBuffer<float>(config.InputSize);
@@ -141,6 +162,9 @@ public sealed class AbcaNetwork : IDisposable
         _gpuEnabled = gpu is not null;
         _hiddenLayer = hidden;
         _outputLayer = output;
+
+        _currentHiddenLR = config.HiddenLearningRate;
+        _currentOutputLR = config.OutputLearningRate;
 
         _inputEncoded = new NativeBuffer<float>(config.InputSize);
         _hiddenPotential = new NativeBuffer<float>(config.HiddenSize);
@@ -258,7 +282,7 @@ public sealed class AbcaNetwork : IDisposable
                 _hiddenAct.AsReadOnlySpan(),
                 prediction,
                 label,
-                _config.OutputLearningRate);
+                _currentOutputLR);
 
             // Synaptic scaling (bio-plausible weight homeostasis)
             // Applied every 256 steps to prevent unbounded weight growth.
@@ -278,7 +302,7 @@ public sealed class AbcaNetwork : IDisposable
                 _hiddenLayer.Weights,
                 _inputEncoded.AsReadOnlySpan(),
                 _hiddenAct.AsReadOnlySpan(),
-                _config.HiddenLearningRate);
+                _currentHiddenLR);
 
             Homeostasis.Update(
                 _hiddenLayer.Bias,
