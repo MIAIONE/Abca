@@ -71,6 +71,7 @@ public sealed class AbcaNetwork : IDisposable
 
     // ── Optional GPU acceleration ────────────────────────────────────────
     private readonly GpuAccelerator? _gpu;
+    private bool _gpuEnabled;
 
     private bool _disposed;
 
@@ -86,6 +87,17 @@ public sealed class AbcaNetwork : IDisposable
     /// <summary>GPU accelerator (null if using CPU only).</summary>
     public GpuAccelerator? Gpu => _gpu;
 
+    /// <summary>
+    /// Enables/disables GPU for forward pass. Disable during training
+    /// (per-sample GPU transfer overhead > CPU SIMD compute for small matrices).
+    /// Enable for batch evaluation or large hidden layers (2000+).
+    /// </summary>
+    public bool GpuEnabled
+    {
+        get => _gpuEnabled;
+        set => _gpuEnabled = value;
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     //  Construction
     // ─────────────────────────────────────────────────────────────────────
@@ -100,6 +112,7 @@ public sealed class AbcaNetwork : IDisposable
     {
         _config = config;
         _gpu = gpu;
+        _gpuEnabled = gpu is not null;
         var rng = new Random(config.Seed);
 
         _hiddenLayer = new CellLayer(config.InputSize, config.HiddenSize, rng);
@@ -125,6 +138,7 @@ public sealed class AbcaNetwork : IDisposable
     {
         _config = config;
         _gpu = gpu;
+        _gpuEnabled = gpu is not null;
         _hiddenLayer = hidden;
         _outputLayer = output;
 
@@ -176,7 +190,7 @@ public sealed class AbcaNetwork : IDisposable
         // ── 2. Hidden layer integration (SIMD or GPU) ──────────────────
         // Each hidden cell: potential = dot(W[j,:], encoded) + bias[j]
         // Bio: dendritic integration of incoming spike rates
-        if (_gpu is not null)
+        if (_gpu is not null && _gpuEnabled)
         {
             _gpu.MatVecMulBias(_hiddenLayer.Weights, enc,
                 _hiddenLayer.Bias.AsReadOnlySpan(), _hiddenPotential.AsSpan());

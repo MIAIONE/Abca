@@ -80,12 +80,12 @@ var config = new NetworkConfig
     OutputSize = 10,
     TopKFraction = topKFraction,
     HiddenLearningRate = 0.01f,
-    OutputLearningRate = 0.001f,
-    HomeostasisRate = 0.001f,
+    OutputLearningRate = 0.01f,      // Bio: higher dopamine = faster learning
+    HomeostasisRate = 0.002f,       // Bio: stronger intrinsic excitability regulation
     HomeostasisDecay = 0.999f,
-    UseRateCoding = true,         // Rate coding: firing rate ∝ intensity (bio)
+    UseRateCoding = true,            // Rate coding: firing rate ∝ intensity (bio)
     SpikeThreshold = 0f,
-    SynapticScaleTarget = 3f,     // Bio-plausible weight homeostasis
+    SynapticScaleTarget = 0f,        // Disabled: critical period → higher plasticity
     Epochs = epochs,
     Seed = seed
 };
@@ -103,20 +103,33 @@ Console.WriteLine($"  Seed:             {config.Seed}");
 Console.WriteLine();
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Training loop — Two-phase bio-inspired training
-//    Phase 1: Unsupervised competitive learning (hidden layer only)
-//    Phase 2: Supervised reward-modulated learning (output layer, hidden frozen)
+//  Training loop — Three-phase bio-inspired training
+//    Phase 1: Unsupervised competitive learning (develop receptive fields)
+//    Phase 2: Full training (both layers learn — most bio-realistic)
+//    Phase 3: Consolidation (output fine-tuning, hidden frozen)
+//
+//  Bio-rationale: In biological development:
+//    1. Visual cortex develops feature detectors before task-specific learning
+//    2. During active learning, ALL layers are simultaneously plastic
+//    3. After learning, plasticity decreases (memory consolidation)
 // ─────────────────────────────────────────────────────────────────────────────
-int warmupEpochs = Math.Max(1, epochs / 6);  // First ~16% for unsupervised feature learning
-int supervisedEpochs = epochs - warmupEpochs;
+int warmupEpochs = Math.Max(2, epochs / 5);       // 20% unsupervised
+int fullEpochs = Math.Max(1, epochs * 3 / 5);     // 60% full (both layers plastic)
+int consolidateEpochs = epochs - warmupEpochs - fullEpochs; // 20% consolidation
 
 Console.WriteLine("[3/5] Training...");
-Console.WriteLine($"  Phase 1: Unsupervised Hebbian feature learning  ({warmupEpochs} epochs)");
-Console.WriteLine($"  Phase 2: Reward-modulated Hebbian classification ({supervisedEpochs} epochs)");
+Console.WriteLine($"  Phase 1: Unsupervised Hebbian feature learning    ({warmupEpochs} epochs)");
+Console.WriteLine($"  Phase 2: Full co-adaptive learning (both layers)  ({fullEpochs} epochs)");
+Console.WriteLine($"  Phase 3: Output consolidation (hidden frozen)     ({consolidateEpochs} epochs)");
 Console.WriteLine("─────────────────────────────────────────────────────────────────────────────────");
 
 var history = new TrainingHistory();
 var rng = new Random(seed);
+
+// GPU strategy: disable during training (CPU SIMD is faster for per-sample
+// 800×784 inference — GPU transfer overhead > compute benefit at this scale).
+// Enable for batch evaluation.
+network.GpuEnabled = false;
 
 // Pre-create shuffle indices
 int[] indices = new int[trainCount];
@@ -127,9 +140,14 @@ for (int epoch = 1; epoch <= epochs; epoch++)
     var sw = Stopwatch.StartNew();
 
     // Determine training mode for this epoch
-    var mode = epoch <= warmupEpochs
-        ? TrainingMode.HiddenOnly
-        : TrainingMode.OutputOnly;
+    // Bio: development → active learning → consolidation
+    TrainingMode mode;
+    if (epoch <= warmupEpochs)
+        mode = TrainingMode.HiddenOnly;           // Develop receptive fields
+    else if (epoch <= warmupEpochs + fullEpochs)
+        mode = TrainingMode.Full;                 // Both layers co-adapt
+    else
+        mode = TrainingMode.OutputOnly;           // Memory consolidation
 
     // Shuffle training data (Fisher-Yates)
     for (int i = trainCount - 1; i > 0; i--)
@@ -153,13 +171,16 @@ for (int epoch = 1; epoch <= epochs; epoch++)
 
     float trainAcc = (float)correct / trainCount;
 
-    // Evaluate on test set (inference only — no softmax/CE in training)
+    // Evaluate on test set (re-enable GPU for inference, weights stable)
+    network.GpuEnabled = true;
     float testAcc = network.Evaluate(testImages, testLabels, testCount);
+    network.GpuEnabled = false;
 
     sw.Stop();
     float sps = trainCount / (float)sw.Elapsed.TotalSeconds;
 
-    string phaseTag = epoch <= warmupEpochs ? "[unsup]" : "[super]";
+    string phaseTag = epoch <= warmupEpochs ? "[unsup]" 
+        : epoch <= warmupEpochs + fullEpochs ? "[full ]" : "[cnsld]";
 
     var metrics = new EpochMetrics
     {
