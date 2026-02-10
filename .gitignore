@@ -4,3 +4,5 @@ obj/
 data/
 .vs/
 *.user
+*.dll
+*.exe

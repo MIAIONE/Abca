@@ -1,19 +1,19 @@
 // ============================================================================
 // ABCA - Asynchronous Bio-inspired Computing Architecture
-// Module: Compute / GpuAccelerator
-// Purpose: GPU-accelerated compute backend using ILGPU (CUDA/OpenCL).
-//          Provides batch matrix-vector multiplication on GPU for the
-//          hidden layer forward pass — the primary computational bottleneck.
+// 模块: Compute / GpuAccelerator
+// 目的: 稀疏脉冲网络的 GPU 加速（CUDA）/ CPU 多核并行回退。
 //
-// Bio-inspired note:
-//   GPU parallelism mirrors biological massive parallelism:
-//   thousands of neurons computing simultaneously.
-//   The GPU doesn't change WHAT is computed, only WHERE.
+// 加速目标: 隐藏层散射-聚集加权和（计算瓶颈）。
+//   每时间步，HiddenSize 个神经元各有 FanIn 个稀疏连接，
+//   需从输入中聚集活跃脉冲并加权求和。
+//   GPU: 每个 CUDA 线程处理一个神经元，天然数据并行。
+//   CPU: Parallel.For 跨核并行（无 CUDA 时自动回退）。
+//
+// 生物学类比:
+//   GPU 大规模并行 ↔ 大脑皮层数千神经元同步放电计算。
+//   加速的是"在哪里"计算，而非"计算什么"。
 // ============================================================================
 
-using System.Numerics.Tensors;
-using System.Runtime.CompilerServices;
-using Abca.Memory;
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.CPU;
@@ -22,17 +22,8 @@ using ILGPU.Runtime.Cuda;
 namespace Abca.Compute;
 
 /// <summary>
-/// GPU-accelerated compute for ABCA's most expensive operations.
-/// Falls back to CPU SIMD if no GPU is available.
-/// 
-/// Primary acceleration target: hidden layer forward pass.
-/// With 800 hidden cells × 784 input dims × 60K samples, this is
-/// ~37 billion FMAs per epoch — ideal for GPU parallelism.
-///
-/// Bio-inspired note:
-///   GPU parallelism mirrors biological massive parallelism —
-///   thousands of neurons computing simultaneously.
-///   The GPU doesn't change WHAT is computed, only WHERE.
+/// 稀疏脉冲网络的 GPU/CPU 并行加速器。
+/// 主要加速隐藏层的散射-聚集加权和运算（训练/推理的计算瓶颈）。
 /// </summary>
 public sealed class GpuAccelerator : IDisposable
 {
@@ -41,33 +32,41 @@ public sealed class GpuAccelerator : IDisposable
     private readonly bool _isGpu;
     private bool _disposed;
 
-    // ── Persistent GPU buffers (avoid per-call allocation) ───────────────
+    // 编译后的 CUDA 核函数
+    private readonly Action<Index1D,
+        ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int> _hiddenKernel;
+
+    // GPU 显存缓冲区（持久化，避免逐次分配）
+    private MemoryBuffer1D<int, Stride1D.Dense>? _gpuIndices;
     private MemoryBuffer1D<float, Stride1D.Dense>? _gpuWeights;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _gpuInput;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _gpuBias;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _gpuSpikes;
     private MemoryBuffer1D<float, Stride1D.Dense>? _gpuResult;
-    private int _cachedRows;
-    private int _cachedCols;
-    private bool _cachedWeightsDirty = true;
 
-    // ── Compiled kernels ─────────────────────────────────────────────────
-    private readonly Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int> _matVecBiasKernel;
+    // CPU 侧引用（CPU 并行路径直接使用 AbcaNetwork 的原始平坦数组）
+    private int[]? _cpuIndices;
+    private float[]? _cpuWeights;
 
-    /// <summary>Whether the accelerator is a GPU (vs CPU fallback).</summary>
+    // 输入脉冲 float 缓冲区（GPU 核函数使用 float 乘法而非 bool 分支）
+    private float[]? _spikeBuffer;
+
+    private int _hiddenSize;
+    private int _fanIn;
+    private int _inputSize;
+    private bool _initialized;
+
+    /// <summary>是否使用 CUDA GPU（否则 CPU 并行回退）。</summary>
     public bool IsGpu => _isGpu;
 
-    /// <summary>Device name.</summary>
+    /// <summary>计算设备名称。</summary>
     public string DeviceName => _accelerator.Name;
 
-    /// <summary>Accelerator type (Cuda, OpenCL, or CPU).</summary>
+    /// <summary>加速器类型。</summary>
     public AcceleratorType AccelType => _accelerator.AcceleratorType;
 
-    /// <summary>
-    /// Creates a GPU accelerator. Forces NVIDIA CUDA; falls back to CPU SIMD
-    /// if no CUDA device is found. OpenCL (Intel iGPU) is explicitly skipped.
-    /// </summary>
     public GpuAccelerator()
     {
         _context = Context.Create(builder =>
@@ -75,7 +74,7 @@ public sealed class GpuAccelerator : IDisposable
             builder.Cuda().CPU().Optimize(OptimizationLevel.O2);
         });
 
-        // Force CUDA (NVIDIA) — skip OpenCL/Intel iGPU entirely
+        // 优先 CUDA（NVIDIA GPU），无则回退 CPU
         Device? cuda = null;
         foreach (var device in _context.Devices)
         {
@@ -90,151 +89,171 @@ public sealed class GpuAccelerator : IDisposable
         _accelerator = cuda.CreateAccelerator(_context);
         _isGpu = _accelerator.AcceleratorType == AcceleratorType.Cuda;
 
-        // Compile kernels
-        _matVecBiasKernel = _accelerator.LoadAutoGroupedStreamKernel<
-            Index1D, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int>(MatVecBiasKernelImpl);
+        // 编译核函数
+        _hiddenKernel = _accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<int, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int>(HiddenWeightedSumKernel);
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  GPU Kernels
+    //  GPU 核函数
     // ─────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// GPU kernel: result[row] = dot(weights[row,:], input) + bias[row].
-    /// Each GPU thread computes one output row (one neuron's response).
+    /// GPU 核函数：计算一个隐藏神经元的加权输入脉冲和。
+    /// result[h] = Σ_k weights[h×fanIn+k] × spikes[indices[h×fanIn+k]]
+    /// 每个 GPU 线程处理一个神经元（h），天然无数据竞争。
     /// </summary>
-    private static void MatVecBiasKernelImpl(
-        Index1D row,
+    private static void HiddenWeightedSumKernel(
+        Index1D h,
+        ArrayView1D<int, Stride1D.Dense> indices,
         ArrayView1D<float, Stride1D.Dense> weights,
-        ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> spikes,
         ArrayView1D<float, Stride1D.Dense> result,
-        int cols,
-        int stride)
+        int fanIn)
     {
-        float sum = bias[row];
-        int offset = row * stride;
-        for (int j = 0; j < cols; j++)
+        float sum = 0f;
+        int baseIdx = h * fanIn;
+        for (int k = 0; k < fanIn; k++)
         {
-            sum += weights[offset + j] * input[j];
+            sum += weights[baseIdx + k] * spikes[indices[baseIdx + k]];
         }
-        result[row] = sum;
+        result[h] = sum;
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  Public API
+    //  公共 API
     // ─────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// GPU-accelerated matrix-vector multiply with bias.
-    /// result[i] = dot(matrix.Row[i], vector) + bias[i]
-    /// 
-    /// If GPU is available, executes on GPU with persistent buffers.
-    /// Otherwise falls back to CPU SIMD (TensorPrimitives.Dot).
+    /// 用隐藏层的稀疏连接拓扑和权重初始化加速器。
+    /// GPU: 上传连接索引和权重到显存（一次性）。
+    /// CPU: 保存数组引用用于并行计算（零拷贝）。
     /// </summary>
-    /// <summary>
-    /// Uploads the weight matrix to GPU. Call once or when weights change.
-    /// Avoids re-uploading every forward pass during evaluation.
-    /// </summary>
-    public void UploadWeights(NativeMatrix matrix)
+    /// <param name="flatConnections">平坦连接索引 [HiddenSize × FanIn]，行主序。</param>
+    /// <param name="flatWeights">平坦权重 [HiddenSize × FanIn]，行主序。</param>
+    /// <param name="hiddenSize">隐藏层神经元数。</param>
+    /// <param name="fanIn">每个神经元的固定入度。</param>
+    /// <param name="inputSize">输入维度。</param>
+    public void Initialize(int[] flatConnections, float[] flatWeights,
+        int hiddenSize, int fanIn, int inputSize)
     {
-        int rows = matrix.Rows;
-        int cols = matrix.Cols;
-        EnsureGpuBuffers(rows, cols, matrix.Stride);
+        _hiddenSize = hiddenSize;
+        _fanIn = fanIn;
+        _inputSize = inputSize;
+        _cpuIndices = flatConnections;
+        _cpuWeights = flatWeights;
+        _spikeBuffer = new float[inputSize];
 
-        float[] temp = new float[rows * matrix.Stride];
-        for (int r = 0; r < rows; r++)
+        if (_isGpu && fanIn > 0 && hiddenSize > 0)
         {
-            matrix.GetRowReadOnly(r).CopyTo(temp.AsSpan(r * matrix.Stride, matrix.Stride));
+            _gpuIndices?.Dispose();
+            _gpuWeights?.Dispose();
+            _gpuSpikes?.Dispose();
+            _gpuResult?.Dispose();
+
+            _gpuIndices = _accelerator.Allocate1D(flatConnections);
+            _gpuWeights = _accelerator.Allocate1D(flatWeights);
+            _gpuSpikes = _accelerator.Allocate1D<float>(inputSize);
+            _gpuResult = _accelerator.Allocate1D<float>(hiddenSize);
         }
-        _gpuWeights!.CopyFromCPU(temp);
+        _initialized = true;
     }
 
     /// <summary>
-    /// GPU-accelerated matrix-vector multiply with bias.
-    /// result[i] = dot(matrix.Row[i], vector) + bias[i]
-    /// 
-    /// If GPU is available, executes on GPU with persistent buffers.
-    /// Otherwise falls back to CPU SIMD (TensorPrimitives.Dot).
+    /// 将 CPU 侧修改后的权重同步到 GPU 显存。
+    /// STDP 或突触缩放修改权重后调用。
+    /// CPU 路径无需操作（共享同一数组引用，零拷贝）。
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void MatVecMulBias(
-        NativeMatrix matrix, ReadOnlySpan<float> vector,
-        ReadOnlySpan<float> bias, Span<float> result)
+    public void SyncWeights(float[] flatWeights)
     {
-        int rows = matrix.Rows;
-        int cols = matrix.Cols;
-
-        if (!_isGpu)
-        {
-            // CPU SIMD fallback
-            SimdMath.MatVecMulBias(matrix, vector, bias, result);
-            return;
-        }
-
-        // ── Ensure GPU buffers are allocated / correct size ──────────────
-        EnsureGpuBuffers(rows, cols, matrix.Stride);
-
-        // ── Upload input + bias (weights are uploaded via UploadWeights) ─
-        _gpuInput!.CopyFromCPU(vector.ToArray());
-        _gpuBias!.CopyFromCPU(bias.ToArray());
-
-        // Upload weights if not pre-uploaded
-        if (_cachedWeightsDirty)
-        {
-            UploadWeights(matrix);
-            _cachedWeightsDirty = false;
-        }
-
-        // ── Execute kernel ──────────────────────────────────────────────
-        _matVecBiasKernel(rows, _gpuWeights!.View, _gpuInput!.View,
-            _gpuBias!.View, _gpuResult!.View, cols, matrix.Stride);
-        _accelerator.Synchronize();
-
-        // ── Download result ─────────────────────────────────────────────
-        float[] cpuResult = new float[rows];
-        _gpuResult.CopyToCPU(cpuResult);
-        cpuResult.AsSpan(0, rows).CopyTo(result);
+        if (_isGpu && _gpuWeights is not null)
+            _gpuWeights.CopyFromCPU(flatWeights);
     }
 
     /// <summary>
-    /// Marks GPU weight buffers as stale (call after CPU-side weight updates).
-    /// Next MatVecMulBias call will re-upload weights.
+    /// 计算所有隐藏神经元的加权输入脉冲和（每时间步调用一次）。
+    /// GPU: CUDA 核函数，一线程一神经元。
+    /// CPU: Parallel.For 多核并行（小网络退化为单线程）。
     /// </summary>
-    public void InvalidateWeights() => _cachedWeightsDirty = true;
-
-    /// <summary>
-    /// Ensures GPU memory buffers are allocated with the right dimensions.
-    /// Buffers are cached and reused across calls.
-    /// </summary>
-    private void EnsureGpuBuffers(int rows, int cols, int stride)
+    /// <param name="inputSpikes">当步输入脉冲 [InputSize]。</param>
+    /// <param name="result">输出缓冲区 [HiddenSize]：每个神经元的加权和。</param>
+    public void ComputeHiddenWeightedSum(bool[] inputSpikes, float[] result)
     {
-        if (_cachedRows == rows && _cachedCols == cols) return;
+        if (!_initialized || _fanIn == 0) return;
 
-        _gpuWeights?.Dispose();
-        _gpuInput?.Dispose();
-        _gpuBias?.Dispose();
-        _gpuResult?.Dispose();
+        if (_isGpu)
+            ComputeGpu(inputSpikes, result);
+        else if (_hiddenSize >= 64)
+            ComputeCpuParallel(inputSpikes, result);
+        else
+            ComputeCpuSingleThread(inputSpikes, result);
+    }
 
-        _gpuWeights = _accelerator.Allocate1D<float>(rows * stride);
-        _gpuInput = _accelerator.Allocate1D<float>(cols);
-        _gpuBias = _accelerator.Allocate1D<float>(rows);
-        _gpuResult = _accelerator.Allocate1D<float>(rows);
+    private void ComputeGpu(bool[] inputSpikes, float[] result)
+    {
+        // bool → float 转换（GPU 使用 float 乘法代替分支）
+        for (int i = 0; i < _inputSize; i++)
+            _spikeBuffer![i] = inputSpikes[i] ? 1f : 0f;
 
-        _cachedRows = rows;
-        _cachedCols = cols;
-        _cachedWeightsDirty = true;
+        _gpuSpikes!.CopyFromCPU(_spikeBuffer!);
+
+        _hiddenKernel(_hiddenSize, _gpuIndices!.View, _gpuWeights!.View,
+            _gpuSpikes!.View, _gpuResult!.View, _fanIn);
+        // CopyToCPU 隐式等待同一 stream 上的核函数完成，无需显式 Synchronize
+
+        _gpuResult.CopyToCPU(result);
+    }
+
+    private void ComputeCpuParallel(bool[] inputSpikes, float[] result)
+    {
+        int fanIn = _fanIn;
+        int[] idx = _cpuIndices!;
+        float[] w = _cpuWeights!;
+
+        Parallel.For(0, _hiddenSize, h =>
+        {
+            float sum = 0f;
+            int baseIdx = h * fanIn;
+            for (int k = 0; k < fanIn; k++)
+            {
+                if (inputSpikes[idx[baseIdx + k]])
+                    sum += w[baseIdx + k];
+            }
+            result[h] = sum;
+        });
+    }
+
+    private void ComputeCpuSingleThread(bool[] inputSpikes, float[] result)
+    {
+        int fanIn = _fanIn;
+        int[] idx = _cpuIndices!;
+        float[] w = _cpuWeights!;
+
+        for (int h = 0; h < _hiddenSize; h++)
+        {
+            float sum = 0f;
+            int baseIdx = h * fanIn;
+            for (int k = 0; k < fanIn; k++)
+            {
+                if (inputSpikes[idx[baseIdx + k]])
+                    sum += w[baseIdx + k];
+            }
+            result[h] = sum;
+        }
     }
 
     public void Dispose()
     {
         if (!_disposed)
         {
+            _gpuIndices?.Dispose();
             _gpuWeights?.Dispose();
-            _gpuInput?.Dispose();
-            _gpuBias?.Dispose();
+            _gpuSpikes?.Dispose();
             _gpuResult?.Dispose();
             _accelerator.Dispose();
             _context.Dispose();

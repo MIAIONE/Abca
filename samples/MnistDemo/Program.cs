@@ -13,8 +13,6 @@
 // Usage: dotnet run [--epochs N] [--hidden N] [--topk F] [--seed N]
 // ============================================================================
 
-using System.Diagnostics;
-using Abca.Compute;
 using Abca.Diagnostics;
 using Abca.IO;
 using Abca.Network;
@@ -25,9 +23,10 @@ const string ModelPath = "abca_mnist.bin";
 // ─────────────────────────────────────────────────────────────────────────────
 //  Parse command-line arguments
 // ─────────────────────────────────────────────────────────────────────────────
-int epochs = GetArgInt(args, "--epochs", 30);
-int hiddenSize = GetArgInt(args, "--hidden", 1600);
-float topKFraction = GetArgFloat(args, "--topk", 0.05f);
+int epochs = GetArgInt(args, "--epochs", 20);
+int hiddenSize = GetArgInt(args, "--hidden", 1200);
+int hiddenFanIn = GetArgInt(args, "--fan-in-hidden", 96);
+int outputFanIn = GetArgInt(args, "--fan-in-output", 200);
 int seed = GetArgInt(args, "--seed", 42);
 
 Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════════╗");
@@ -51,25 +50,6 @@ Console.WriteLine($"  Test samples:     {testCount:N0}");
 Console.WriteLine();
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Initialize GPU (optional — falls back to CPU SIMD if no GPU)
-// ─────────────────────────────────────────────────────────────────────────────
-GpuAccelerator? gpu = null;
-try
-{
-    gpu = new GpuAccelerator();
-    Console.WriteLine($"[GPU] Device:     {gpu.DeviceName}");
-    Console.WriteLine($"[GPU] Type:       {gpu.AccelType}");
-    Console.WriteLine($"[GPU] Accelerated: {(gpu.IsGpu ? "Yes (GPU)" : "No (CPU fallback)")}");
-    Console.WriteLine();
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"[GPU] Not available: {ex.Message}");
-    Console.WriteLine("[GPU] Falling back to CPU SIMD (AVX-512).");
-    Console.WriteLine();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  Create network
 // ─────────────────────────────────────────────────────────────────────────────
 Console.WriteLine("[2/5] Creating ABCA network...");
@@ -78,124 +58,78 @@ var config = new NetworkConfig
     InputSize = 784,
     HiddenSize = hiddenSize,
     OutputSize = 10,
-    TopKFraction = topKFraction,
-    HiddenLearningRate = 0.01f,
-    OutputLearningRate = 0.01f,      // Bio: higher dopamine = faster learning
-    HomeostasisRate = 0.002f,       // Bio: stronger intrinsic excitability regulation
-    HomeostasisDecay = 0.999f,
-    UseRateCoding = true,            // Rate coding: firing rate ∝ intensity (bio)
-    SpikeThreshold = 0f,
-    SynapticScaleTarget = 5f,        // Mild: prevents unbounded weight growth (bio: synaptic receptor density limit)
+    HiddenFanIn = hiddenFanIn,
+    OutputFanIn = outputFanIn,
+    HiddenMaxSpikesPerStep = 100,
+    OutputMaxSpikesPerStep = 5,
+    TimeSteps = 10,
+    HiddenDecay = 0.85f,
+    OutputDecay = 0.85f,
+    HiddenThreshold = 0.3f,
+    OutputThreshold = 0.2f,
+    HiddenRefractory = 1,
+    OutputRefractory = 1,
+    HiddenLtpLearningRate = 0.01f,
+    HiddenLtdLearningRate = 0.004f,
+    OutputLearningRate = 0.04f,
+    EligibilityDecay = 0.90f,
+    TraceDecay = 0.85f,
+    SynapticScaleTarget = 5f,
+    SynapticScalePeriod = 100,
+    WeightClamp = 3.0f,
+    UseRateCoding = true,
+    InputRateScale = 0.5f,
     Epochs = epochs,
     Seed = seed
 };
 
-using var network = new AbcaNetwork(config, gpu);
+using var network = new AbcaNetwork(config);
 Console.WriteLine($"  Hidden cells:     {config.HiddenSize}");
-Console.WriteLine($"  Top-K winners:    {config.TopK} ({config.TopKFraction:P0} of hidden)");
-Console.WriteLine($"  Input encoding:   {(config.UseRateCoding ? "Rate coding" : "Binary spikes")}");
-Console.WriteLine($"  Compute backend:  {(gpu?.IsGpu == true ? $"GPU ({gpu.DeviceName})" : "CPU SIMD")}");
+Console.WriteLine($"  Hidden fan-in:    {config.HiddenFanIn}");
+Console.WriteLine($"  Output fan-in:    {config.OutputFanIn}");
+Console.WriteLine($"  Compute device:   {network.Gpu.DeviceName} ({(network.Gpu.IsGpu ? "CUDA GPU" : "CPU Parallel")})");
+Console.WriteLine($"  Input encoding:   {(config.UseRateCoding ? "Poisson rate" : "Binary spikes")}");
+Console.WriteLine($"  Time steps:       {config.TimeSteps}");
 Console.WriteLine($"  Synaptic scale:   {config.SynapticScaleTarget}");
-Console.WriteLine($"  Hidden LR:        {config.HiddenLearningRate}");
+Console.WriteLine($"  Hidden LTP/LTD:   {config.HiddenLtpLearningRate}/{config.HiddenLtdLearningRate}");
 Console.WriteLine($"  Output LR:        {config.OutputLearningRate}");
 Console.WriteLine($"  Epochs:           {config.Epochs}");
 Console.WriteLine($"  Seed:             {config.Seed}");
 Console.WriteLine();
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Training loop — Three-phase bio-inspired training
-//    Phase 1: Unsupervised competitive learning (develop receptive fields)
-//    Phase 2: Full training (both layers learn — most bio-realistic)
-//    Phase 3: Consolidation (output fine-tuning, hidden frozen)
-//
-//  Bio-rationale: In biological development:
-//    1. Visual cortex develops feature detectors before task-specific learning
-//    2. During active learning, ALL layers are simultaneously plastic
-//    3. After learning, plasticity decreases (memory consolidation)
-// ─────────────────────────────────────────────────────────────────────────────
-int warmupEpochs = Math.Max(2, epochs / 5);       // 20% unsupervised
-int fullEpochs = Math.Max(1, epochs * 2 / 5);     // 40% full (both layers plastic)
-int consolidateEpochs = epochs - warmupEpochs - fullEpochs; // 40% consolidation
-
 Console.WriteLine("[3/5] Training...");
-Console.WriteLine($"  Phase 1: Unsupervised Hebbian feature learning    ({warmupEpochs} epochs)");
-Console.WriteLine($"  Phase 2: Full co-adaptive learning (both layers)  ({fullEpochs} epochs)");
-Console.WriteLine($"  Phase 3: Output consolidation (hidden frozen)     ({consolidateEpochs} epochs)");
 Console.WriteLine("─────────────────────────────────────────────────────────────────────────────────");
 
 var history = new TrainingHistory();
 var rng = new Random(seed);
-
-// GPU strategy: disable during training (CPU SIMD is faster for per-sample
-// 800×784 inference — GPU transfer overhead > compute benefit at this scale).
-// Enable for batch evaluation.
-network.GpuEnabled = false;
-
-// Pre-create shuffle indices
 int[] indices = new int[trainCount];
 for (int i = 0; i < trainCount; i++) indices[i] = i;
 
 for (int epoch = 1; epoch <= epochs; epoch++)
 {
-    var sw = Stopwatch.StartNew();
+    var sw = System.Diagnostics.Stopwatch.StartNew();
 
-    // Determine training mode for this epoch
-    // Bio: development → active learning → consolidation
-    TrainingMode mode;
-    if (epoch <= warmupEpochs)
-        mode = TrainingMode.HiddenOnly;           // Develop receptive fields
-    else if (epoch <= warmupEpochs + fullEpochs)
-        mode = TrainingMode.Full;                 // Both layers co-adapt
-    else
-        mode = TrainingMode.OutputOnly;           // Memory consolidation
-
-    // ── Learning rate schedule (bio-justified) ───────────────────────
-    // Bio: critical period plasticity is high, mature cortex plasticity decreases.
-    // This mimics the gradual reduction in NMDA receptor expression with age.
-    float epochProgress = (float)epoch / epochs;                        // 0→1
-    float lrScale = 1.0f / (1.0f + 3.0f * epochProgress);             // 1.0 → 0.25 over training
-
-    // In Full mode, reduce hidden LR further to prevent catastrophic forgetting
-    // Bio: mature receptive fields are more stable than developing ones
-    float hiddenLrScale = mode == TrainingMode.Full ? lrScale * 0.3f : lrScale;
-
-    // Apply scaled learning rates
-    network.SetLearningRates(
-        config.HiddenLearningRate * hiddenLrScale,
-        config.OutputLearningRate * lrScale);
-
-    // Shuffle training data (Fisher-Yates)
+    // 打乱数据
     for (int i = trainCount - 1; i > 0; i--)
     {
         int j = rng.Next(i + 1);
         (indices[i], indices[j]) = (indices[j], indices[i]);
     }
 
-    // Train
     int correct = 0;
-
     for (int s = 0; s < trainCount; s++)
     {
         int idx = indices[s];
         ReadOnlySpan<float> img = trainImages.AsSpan(idx * 784, 784);
         int label = trainLabels[idx];
-
-        if (network.TrainStep(img, label, mode))
-            correct++;
+        if (network.TrainSample(img, label)) correct++;
     }
 
     float trainAcc = (float)correct / trainCount;
-
-    // Evaluate on test set (re-enable GPU for inference, weights stable)
-    network.GpuEnabled = true;
     float testAcc = network.Evaluate(testImages, testLabels, testCount);
-    network.GpuEnabled = false;
 
     sw.Stop();
     float sps = trainCount / (float)sw.Elapsed.TotalSeconds;
-
-    string phaseTag = epoch <= warmupEpochs ? "[unsup]"
-        : epoch <= warmupEpochs + fullEpochs ? "[full ]" : "[cnsld]";
 
     var metrics = new EpochMetrics
     {
@@ -209,7 +143,7 @@ for (int epoch = 1; epoch <= epochs; epoch++)
     };
 
     history.Record(metrics);
-    Console.WriteLine($"{phaseTag} {metrics}");
+    Console.WriteLine(metrics);
 }
 
 Console.WriteLine("─────────────────────────────────────────────────────────────────────────────────");
@@ -218,7 +152,7 @@ Console.WriteLine();
 // ─────────────────────────────────────────────────────────────────────────────
 //  Save model
 // ─────────────────────────────────────────────────────────────────────────────
-Console.WriteLine("[4/5] Saving model...");
+Console.WriteLine("[4/5] Saving model (稀疏事件驱动格式 v3)...");
 ModelSerializer.Save(network, ModelPath);
 var fileSize = new FileInfo(ModelPath).Length;
 Console.WriteLine($"  Saved to: {ModelPath} ({fileSize:N0} bytes)");
@@ -231,14 +165,13 @@ Console.WriteLine("[5/5] Verifying save/load round-trip...");
 using var loaded = ModelSerializer.Load(ModelPath);
 float loadedAcc = loaded.Evaluate(testImages, testLabels, testCount);
 Console.WriteLine($"  Loaded model test accuracy: {loadedAcc:P2}");
-Console.WriteLine($"  Round-trip verified: accuracy matches last epoch");
+Console.WriteLine($"  Round-trip verified");
 Console.WriteLine();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Summary
 // ─────────────────────────────────────────────────────────────────────────────
 history.PrintSummary();
-gpu?.Dispose();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CLI argument helpers

@@ -1,373 +1,613 @@
 // ============================================================================
 // ABCA - Asynchronous Bio-inspired Computing Architecture
-// Module: Network / AbcaNetwork
-// Purpose: The complete ABCA neural network.
-//
-//   Architecture:  Input(784) → Hidden(800) → Output(10)
-//
-//   Forward pass (bio-inspired):
-//     1. Input encoding: rate coding (firing rate ∝ intensity) or binary spikes
-//     2. Hidden: weighted sum of encoded input + bias → ReLU threshold → TopK
-//        (bio: integrate-and-fire + lateral inhibition)
-//     3. Output: Σ(W × hidden_activity) + bias → argmax
-//        (bio: EPSP proportional to synaptic weight × pre-synaptic rate)
-//
-//   Learning (genuinely bio-inspired):
-//     Hidden: Competitive Hebbian (winners move toward input pattern)
-//     Output: Reward-modulated Hebbian (three-factor rule)
-//       - ΔW = reward × pre_activity × post_activity × lr
-//       - Correct → strengthen winner's synapses to active hidden cells
-//       - Wrong → weaken wrong winner, strengthen correct class
-//     Homeostasis: Adaptive bias to maintain target firing rate
-//
-//   What is NOT here (traditional ML artifacts removed):
-//     ✗ Softmax normalization in training
-//     ✗ Cross-entropy loss in training
-//     ✗ Error = target - predicted (disguised gradient)
-//     ✗ Weight decay / L2 regularization
-//     ✗ Any form of backpropagation
+// 模块: Network / AbcaNetwork
+// 目的: 稀疏、事件驱动、离散时间的脉冲网络实现，完全局部学习，无反向传播。
+//       - 固定 fan-in 稀疏连接（输入→隐藏，隐藏→输出）
+//       - 平坦行主序数组（GPU 友好，零拷贝权重同步）
+//       - 膜电位衰减 + 阈值发放 + 折返期（LIF 模型）
+//       - 每步 Top-K 侧抑制（抑制性中间神经元网络）
+//       - 输入泊松脉冲编码或二值阈值脉冲
+//       - 隐藏层 STDP（脉冲时序依赖可塑性）
+//       - 输出层奖励调制三因子规则（资格迹 × 多巴胺信号）
+//       - 自稳态内在可塑性（自适应发放阈值）
+//       - 突触缩放与权值裁剪保持生物学有界性
+//       - GPU (CUDA) / CPU 多核并行加速隐藏层计算
 // ============================================================================
 
 using System.Runtime.CompilerServices;
 using Abca.Compute;
-using Abca.Learning;
-using Abca.Memory;
 
 namespace Abca.Network;
 
-/// <summary>
-/// Controls which layers update their weights during training.
-/// </summary>
-public enum TrainingMode
-{
-    /// <summary>Both hidden (unsupervised) and output (supervised) layers learn.</summary>
-    Full,
-    /// <summary>Only hidden layer learns via competitive Hebbian (unsupervised pre-training).</summary>
-    HiddenOnly,
-    /// <summary>Only output layer learns via reward-modulated Hebbian (hidden frozen).</summary>
-    OutputOnly,
-}
-
-/// <summary>
-/// The ABCA bio-inspired network: spike-based encoding, competitive feature
-/// extraction, and reward-modulated Hebbian classification.
-/// Zero backpropagation. All learning is local.
-/// </summary>
 public sealed class AbcaNetwork : IDisposable
 {
-    private readonly NetworkConfig _config;
-    private readonly CellLayer _hiddenLayer;
-    private readonly CellLayer _outputLayer;
+    public NetworkConfig Config { get; }
 
-    // ── Scratch buffers (pre-allocated, reused per forward pass) ──────────
-    private readonly NativeBuffer<float> _inputEncoded;     // rate-coded [0,1] or binary spikes
-    private readonly NativeBuffer<float> _hiddenPotential;  // raw hidden potentials
-    private readonly NativeBuffer<float> _hiddenAct;        // post-inhibition activities
-    private readonly NativeBuffer<float> _outputPotential;  // raw output potentials
+    private readonly Random _rng;
 
-    // ── Homeostasis state ────────────────────────────────────────────────
-    private readonly NativeBuffer<float> _avgActivity;      // running avg activity per hidden cell
-    private int _step;                                       // training step counter
+    // 隐藏层稀疏连接（行主序平坦数组，GPU 友好布局）
+    // _hiddenIn[h * _hFanIn + k] = 第 h 个隐藏细胞的第 k 个输入索引
+    // _hiddenW [h * _hFanIn + k] = 对应的突触权重
+    private readonly int[] _hiddenIn;
+    private readonly float[] _hiddenW;
+    private readonly int _hFanIn;
 
-    // ── Runtime learning rates (can be adjusted for LR schedule) ──────
-    private float _currentHiddenLR;
-    private float _currentOutputLR;
+    // 输出层稀疏连接（同上）
+    private readonly int[] _outputIn;
+    private readonly float[] _outputW;
+    private readonly float[] _outputElig; // 资格迹
+    private readonly int _oFanIn;
 
-    // ── Optional GPU acceleration ────────────────────────────────────────
-    private readonly GpuAccelerator? _gpu;
-    private bool _gpuEnabled;
+    // 膜电位 & 折返期
+    private readonly float[] _vHidden;
+    private readonly float[] _vOutput;
+    private readonly int[] _refHidden;
+    private readonly int[] _refOutput;
 
-    private bool _disposed;
+    // 当步脉冲标记
+    private readonly bool[] _inputSpikes;
+    private readonly bool[] _hiddenSpikes;
+    private readonly bool[] _outputSpikes;
 
-    /// <summary>Network configuration.</summary>
-    public NetworkConfig Config => _config;
+    // 迹（短时记忆）
+    private readonly float[] _inputTrace;
+    private readonly float[] _hiddenTrace;
 
-    /// <summary>Hidden cell layer (for inspection / serialization).</summary>
-    public CellLayer HiddenLayer => _hiddenLayer;
+    // 发放计数（用于读出）
+    private readonly int[] _outputSpikeCount;
 
-    /// <summary>Output cell layer (for inspection / serialization).</summary>
-    public CellLayer OutputLayer => _outputLayer;
+    // 自稳态内在可塑性（自由能原理：最小化长期惊讶）
+    private readonly float[] _thrHidden;        // 每个隐藏细胞的自适应发放阈值
+    private readonly float[] _avgRateHidden;    // 运行平均发放率
+    private readonly int[] _hiddenSpikeCount;   // 当前样本内发放计数
 
-    /// <summary>GPU accelerator (null if using CPU only).</summary>
-    public GpuAccelerator? Gpu => _gpu;
+    // GPU / CPU 并行加速器
+    private readonly GpuAccelerator _gpu;
+    private readonly float[] _hiddenInput; // GPU/并行计算结果缓冲区
+    private bool _weightsDirty;
 
-    /// <summary>
-    /// Enables/disables GPU for forward pass. Disable during training
-    /// (per-sample GPU transfer overhead > CPU SIMD compute for small matrices).
-    /// Enable for batch evaluation or large hidden layers (2000+).
-    /// </summary>
-    public bool GpuEnabled
+    // 侧抑制排序缓存
+    private readonly List<(float v, int idx)> _candidates = new(256);
+
+    private int _sampleCounter;
+
+    /// <summary>GPU 加速器实例（诊断/状态查询）。</summary>
+    public GpuAccelerator Gpu => _gpu;
+
+    public AbcaNetwork(NetworkConfig config)
     {
-        get => _gpuEnabled;
-        set => _gpuEnabled = value;
-    }
+        Config = config;
+        _rng = new Random(config.Seed);
 
-    /// <summary>
-    /// Adjusts runtime learning rates (for LR schedule / decay).
-    /// Bio-rationale: NMDA receptor expression decreases with age,
-    /// reducing synaptic plasticity from critical period to maturity.
-    /// </summary>
-    /// <param name="hiddenLR">Current hidden layer learning rate.</param>
-    /// <param name="outputLR">Current output layer learning rate.</param>
-    public void SetLearningRates(float hiddenLR, float outputLR)
-    {
-        _currentHiddenLR = hiddenLR;
-        _currentOutputLR = outputLR;
-    }
+        // 自动限制 fan-in（生物学中若输入少于目标入度，则连接全部可用输入）
+        int hFanIn = Math.Min(config.HiddenFanIn, config.InputSize);
+        int oFanIn = Math.Min(config.OutputFanIn, config.HiddenSize);
+        _hFanIn = hFanIn;
+        _oFanIn = oFanIn;
 
-    // ─────────────────────────────────────────────────────────────────────
-    //  Construction
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Creates a new ABCA network with the specified configuration.
-    /// All weights are initialized randomly; the network is ready to train.
-    /// </summary>
-    /// <param name="config">Network configuration.</param>
-    /// <param name="gpu">Optional GPU accelerator for hidden layer forward pass.</param>
-    public AbcaNetwork(NetworkConfig config, GpuAccelerator? gpu = null)
-    {
-        _config = config;
-        _gpu = gpu;
-        _gpuEnabled = gpu is not null;
-        var rng = new Random(config.Seed);
-
-        _hiddenLayer = new CellLayer(config.InputSize, config.HiddenSize, rng);
-        _outputLayer = new CellLayer(config.HiddenSize, config.OutputSize, rng);
-
-        // Runtime learning rates (default from config)
-        _currentHiddenLR = config.HiddenLearningRate;
-        _currentOutputLR = config.OutputLearningRate;
-
-        // Scratch buffers
-        _inputEncoded = new NativeBuffer<float>(config.InputSize);
-        _hiddenPotential = new NativeBuffer<float>(config.HiddenSize);
-        _hiddenAct = new NativeBuffer<float>(config.HiddenSize);
-        _outputPotential = new NativeBuffer<float>(config.OutputSize);
-
-        // Homeostasis
-        _avgActivity = new NativeBuffer<float>(config.HiddenSize);
-        float target = config.TopKFraction;
-        Span<float> avg = _avgActivity.AsSpan();
-        for (int i = 0; i < avg.Length; i++) avg[i] = target;
-    }
-
-    /// <summary>
-    /// Internal constructor for deserialization (layers created externally).
-    /// </summary>
-    internal AbcaNetwork(NetworkConfig config, CellLayer hidden, CellLayer output, GpuAccelerator? gpu = null)
-    {
-        _config = config;
-        _gpu = gpu;
-        _gpuEnabled = gpu is not null;
-        _hiddenLayer = hidden;
-        _outputLayer = output;
-
-        _currentHiddenLR = config.HiddenLearningRate;
-        _currentOutputLR = config.OutputLearningRate;
-
-        _inputEncoded = new NativeBuffer<float>(config.InputSize);
-        _hiddenPotential = new NativeBuffer<float>(config.HiddenSize);
-        _hiddenAct = new NativeBuffer<float>(config.HiddenSize);
-        _outputPotential = new NativeBuffer<float>(config.OutputSize);
-        _avgActivity = new NativeBuffer<float>(config.HiddenSize);
-        float target = config.TopKFraction;
-        Span<float> avg = _avgActivity.AsSpan();
-        for (int i = 0; i < avg.Length; i++) avg[i] = target;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    //  Forward Pass (Inference)
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Runs a forward pass and returns the predicted class index.
-    ///
-    /// Bio-inspired pipeline:
-    ///   1. Spike encoding: continuous input → binary {0,1}
-    ///   2. Hidden integration: each cell sums weighted spikes + bias
-    ///   3. ReLU threshold: cells below zero are silent
-    ///   4. Lateral inhibition: TopK competition, losers silenced
-    ///   5. Output integration: each output cell sums weights from active hidden cells
-    ///   6. Winner: cell with highest potential = prediction
-    /// </summary>
-    /// <param name="input">Input vector (e.g. 784 pixel values in [0,1]).</param>
-    /// <returns>Predicted class index.</returns>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public int Forward(ReadOnlySpan<float> input)
-    {
-        // ── 1. Input encoding ────────────────────────────────────────────
-        Span<float> encoded = _inputEncoded.AsSpan();
-        if (_config.UseRateCoding)
+        // 隐藏层：构建平坦稀疏连接
+        _hiddenIn = new int[config.HiddenSize * hFanIn];
+        _hiddenW = new float[config.HiddenSize * hFanIn];
+        for (int h = 0; h < config.HiddenSize; h++)
         {
-            // Rate coding: firing rate = stimulus intensity [0,1]
-            // Bio: retinal ganglion cells fire at rates proportional to light
-            input.CopyTo(encoded);
-        }
-        else
-        {
-            // Binary spikes: threshold binarization
-            SimdMath.SpikeEncode(input, encoded, _config.SpikeThreshold);
-        }
-        ReadOnlySpan<float> enc = _inputEncoded.AsReadOnlySpan();
-
-        // ── 2. Hidden layer integration (SIMD or GPU) ──────────────────
-        // Each hidden cell: potential = dot(W[j,:], encoded) + bias[j]
-        // Bio: dendritic integration of incoming spike rates
-        if (_gpu is not null && _gpuEnabled)
-        {
-            _gpu.MatVecMulBias(_hiddenLayer.Weights, enc,
-                _hiddenLayer.Bias.AsReadOnlySpan(), _hiddenPotential.AsSpan());
-        }
-        else
-        {
-            _hiddenLayer.Forward(enc, _hiddenPotential.AsSpan());
+            int[] indices = SampleUnique(config.InputSize, hFanIn, _rng);
+            float[] weights = InitWeights(hFanIn, _rng);
+            int baseIdx = h * hFanIn;
+            Array.Copy(indices, 0, _hiddenIn, baseIdx, hFanIn);
+            Array.Copy(weights, 0, _hiddenW, baseIdx, hFanIn);
         }
 
-        // ── 3. ReLU threshold ────────────────────────────────────────────
-        // Bio: action potential threshold — cells below zero are silent
-        Span<float> hAct = _hiddenAct.AsSpan();
-        _hiddenPotential.AsReadOnlySpan().CopyTo(hAct);
-        SimdMath.ReLUInPlace(hAct);
-
-        // ── 4. Lateral inhibition (TopK) ─────────────────────────────────
-        // Bio: inhibitory interneurons suppress weak responders
-        SimdMath.TopK(hAct, _config.TopK);
-
-        // ── 5. Output layer integration (graded SIMD dot product) ────────
-        // output[k] = dot(W[k,:], hidden_activity) + bias[k]
-        // Bio: EPSP proportional to synaptic weight × pre-synaptic firing rate
-        _outputLayer.Forward(_hiddenAct.AsReadOnlySpan(), _outputPotential.AsSpan());
-
-        // ── 6. Winner selection ──────────────────────────────────────────
-        // Bio: the most activated output cell "wins" (decision)
-        return SimdMath.ArgMax(_outputPotential.AsReadOnlySpan());
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    //  Training Step
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Performs a single training step: forward pass + local weight updates.
-    ///
-    /// Learning is purely bio-inspired:
-    ///   - Hidden: Competitive Hebbian (unsupervised feature extraction)
-    ///   - Output: Reward-modulated Hebbian (three-factor rule)
-    ///   - Homeostasis: Adaptive excitability regulation
-    ///
-    /// There is NO softmax, NO error vector, NO gradient, NO weight decay.
-    /// </summary>
-    /// <param name="input">Input vector.</param>
-    /// <param name="label">Correct class label (0-based).</param>
-    /// <param name="mode">Which layers to update.</param>
-    /// <returns>True if the prediction was correct.</returns>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public bool TrainStep(ReadOnlySpan<float> input, int label, TrainingMode mode = TrainingMode.Full)
-    {
-        // Forward pass (populates _inputEncoded, _hiddenAct, _outputPotential)
-        int prediction = Forward(input);
-        bool correct = prediction == label;
-        _step++;
-
-        // ── Output layer: Reward-modulated Hebbian (SIMD) ────────────────
-        // Three-factor rule: ΔW ∝ reward × pre_activity × lr
-        // The ONLY supervised signal is a scalar reward (correct/wrong).
-        // NO softmax, NO error = target - predicted, NO gradient.
-        if (mode != TrainingMode.HiddenOnly)
+        // 输出层：构建平坦稀疏连接
+        _outputIn = new int[config.OutputSize * oFanIn];
+        _outputW = new float[config.OutputSize * oFanIn];
+        _outputElig = new float[config.OutputSize * oFanIn];
+        for (int o = 0; o < config.OutputSize; o++)
         {
-            RewardModulatedHebbian.Update(
-                _outputLayer.Weights,
-                _outputLayer.Bias,
-                _hiddenAct.AsReadOnlySpan(),
-                _outputPotential.AsReadOnlySpan(),
-                prediction,
-                label,
-                _currentOutputLR);
-
-            // Synaptic scaling (bio-plausible weight homeostasis)
-            // Applied every 256 steps to prevent unbounded weight growth.
-            // Bio: limited synaptic receptor density.
-            if (_config.SynapticScaleTarget > 0f && (_step & 0xFF) == 0)
-            {
-                SimdMath.SynapticScale(_outputLayer.Weights, _config.SynapticScaleTarget);
-            }
+            int[] indices = SampleUnique(config.HiddenSize, oFanIn, _rng);
+            float[] weights = InitWeights(oFanIn, _rng);
+            int baseIdx = o * oFanIn;
+            Array.Copy(indices, 0, _outputIn, baseIdx, oFanIn);
+            Array.Copy(weights, 0, _outputW, baseIdx, oFanIn);
         }
 
-        // ── Hidden layer: Competitive Hebbian (SIMD) ─────────────────────
-        // Winners move their weight vectors toward the encoded input pattern.
-        // This is unsupervised — no label information used.
-        if (mode != TrainingMode.OutputOnly)
+        // 神经元状态
+        _vHidden = new float[config.HiddenSize];
+        _vOutput = new float[config.OutputSize];
+        _refHidden = new int[config.HiddenSize];
+        _refOutput = new int[config.OutputSize];
+
+        _inputSpikes = new bool[config.InputSize];
+        _hiddenSpikes = new bool[config.HiddenSize];
+        _outputSpikes = new bool[config.OutputSize];
+
+        _inputTrace = new float[config.InputSize];
+        _hiddenTrace = new float[config.HiddenSize];
+
+        _outputSpikeCount = new int[config.OutputSize];
+
+        // 自稳态内在可塑性初始化
+        _thrHidden = new float[config.HiddenSize];
+        Array.Fill(_thrHidden, config.HiddenThreshold);
+        _avgRateHidden = new float[config.HiddenSize];
+        Array.Fill(_avgRateHidden, config.TargetFiringRate);
+        _hiddenSpikeCount = new int[config.HiddenSize];
+
+        // GPU 加速初始化
+        _gpu = new GpuAccelerator();
+        _hiddenInput = new float[config.HiddenSize];
+        _gpu.Initialize(_hiddenIn, _hiddenW, config.HiddenSize, hFanIn, config.InputSize);
+    }
+
+    // 用于反序列化的内部构造
+    internal AbcaNetwork(NetworkConfig config,
+        int[] hiddenIn, float[] hiddenW, int hFanIn,
+        int[] outputIn, float[] outputW, float[] outputElig, int oFanIn,
+        float[]? thrHidden = null)
+    {
+        Config = config;
+        _rng = new Random(config.Seed);
+        _hFanIn = hFanIn;
+        _oFanIn = oFanIn;
+
+        _hiddenIn = hiddenIn;
+        _hiddenW = hiddenW;
+        _outputIn = outputIn;
+        _outputW = outputW;
+        _outputElig = outputElig;
+
+        _vHidden = new float[config.HiddenSize];
+        _vOutput = new float[config.OutputSize];
+        _refHidden = new int[config.HiddenSize];
+        _refOutput = new int[config.OutputSize];
+
+        _inputSpikes = new bool[config.InputSize];
+        _hiddenSpikes = new bool[config.HiddenSize];
+        _outputSpikes = new bool[config.OutputSize];
+
+        _inputTrace = new float[config.InputSize];
+        _hiddenTrace = new float[config.HiddenSize];
+
+        _outputSpikeCount = new int[config.OutputSize];
+
+        _thrHidden = thrHidden ?? new float[config.HiddenSize];
+        if (thrHidden is null) Array.Fill(_thrHidden, config.HiddenThreshold);
+        _avgRateHidden = new float[config.HiddenSize];
+        Array.Fill(_avgRateHidden, config.TargetFiringRate);
+        _hiddenSpikeCount = new int[config.HiddenSize];
+
+        // GPU 加速初始化
+        _gpu = new GpuAccelerator();
+        _hiddenInput = new float[config.HiddenSize];
+        _gpu.Initialize(_hiddenIn, _hiddenW, config.HiddenSize, hFanIn, config.InputSize);
+    }
+
+    // 序列化访问器（仅序列化器使用）
+    internal int[] GetHiddenConnections() => _hiddenIn;
+    internal float[] GetHiddenWeights() => _hiddenW;
+    internal int GetHiddenFanIn() => _hFanIn;
+    internal int[] GetOutputConnections() => _outputIn;
+    internal float[] GetOutputWeights() => _outputW;
+    internal float[] GetOutputEligibility() => _outputElig;
+    internal int GetOutputFanIn() => _oFanIn;
+    internal float[] GetHiddenThresholds() => _thrHidden;
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  训练 / 推理（事件驱动）
+    // ─────────────────────────────────────────────────────────────────────
+
+    public bool TrainSample(ReadOnlySpan<float> input, int label)
+    {
+        int pred = SimulateSample(input, learn: true);
+        bool correct = pred == label;
+
+        // 奖励调制：三因子规则的全局多巴胺信号
+        float reward = correct ? Config.RewardPositive : Config.RewardNegative;
+        ApplyReward(reward);
+
+        // 施加奖励后清除资格迹（避免跨样本污染）
+        ClearEligibility();
+
+        // 自稳态内在可塑性：调节隐藏层每个细胞的发放阈值
+        // 生物学：离子通道表达调节兴奋性（Desai 等 1999）
+        // 自由能原理：维持内部模型的稳定预测能力
+        UpdateHomeostasis();
+
+        _sampleCounter++;
+        if (Config.SynapticScaleTarget > 0 && (_sampleCounter % Config.SynapticScalePeriod) == 0)
         {
-            CompetitiveLearning.UpdateWeights(
-                _hiddenLayer.Weights,
-                _inputEncoded.AsReadOnlySpan(),
-                _hiddenAct.AsReadOnlySpan(),
-                _currentHiddenLR);
-
-            Homeostasis.Update(
-                _hiddenLayer.Bias,
-                _avgActivity,
-                _hiddenAct.AsReadOnlySpan(),
-                _config.TopKFraction,
-                _config.HomeostasisRate,
-                _config.HomeostasisDecay);
-
-            // Synaptic scaling for hidden layer (every 1024 steps)
-            if (_config.SynapticScaleTarget > 0f && (_step & 0x3FF) == 0)
-            {
-                SimdMath.SynapticScale(_hiddenLayer.Weights, _config.SynapticScaleTarget);
-            }
-
-            // Inform GPU that hidden weights have changed
-            _gpu?.InvalidateWeights();
+            ScaleAll();
         }
 
         return correct;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    //  Batch Evaluation
-    // ─────────────────────────────────────────────────────────────────────
+    public int Predict(ReadOnlySpan<float> input)
+    {
+        return SimulateSample(input, learn: false);
+    }
 
-    /// <summary>
-    /// Evaluates the network on a dataset (inference only, no learning).
-    /// </summary>
-    /// <param name="images">Flat array of images (count × inputSize).</param>
-    /// <param name="labels">Label array.</param>
-    /// <param name="count">Number of samples.</param>
-    /// <returns>Accuracy as a fraction in [0, 1].</returns>
     public float Evaluate(ReadOnlySpan<float> images, ReadOnlySpan<byte> labels, int count)
     {
         int correct = 0;
-        int inputSize = _config.InputSize;
-
+        int stride = Config.InputSize;
         for (int i = 0; i < count; i++)
         {
-            ReadOnlySpan<float> img = images.Slice(i * inputSize, inputSize);
-            int pred = Forward(img);
-            if (pred == labels[i]) correct++;
+            ReadOnlySpan<float> img = images.Slice(i * stride, stride);
+            if (Predict(img) == labels[i]) correct++;
         }
-
         return (float)correct / count;
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  Dispose
+    //  核心仿真
     // ─────────────────────────────────────────────────────────────────────
+
+    private int SimulateSample(ReadOnlySpan<float> input, bool learn)
+    {
+        // 权重已被 STDP/突触缩放修改，同步到 GPU 显存
+        if (_weightsDirty)
+        {
+            _gpu.SyncWeights(_hiddenW);
+            _weightsDirty = false;
+        }
+
+        // 每个样本开始前完全重置神经元状态（样本间无时间连续性）
+        ResetState();
+
+        for (int t = 0; t < Config.TimeSteps; t++)
+        {
+            EncodeInput(input);
+            UpdateHidden(learn);
+            UpdateOutput(learn);
+        }
+
+        // 读出：输出层发放次数 ArgMax；若全零则用膜电位最大者
+        int winner = 0;
+        int bestCount = _outputSpikeCount[0];
+        for (int i = 1; i < _outputSpikeCount.Length; i++)
+        {
+            if (_outputSpikeCount[i] > bestCount)
+            {
+                bestCount = _outputSpikeCount[i];
+                winner = i;
+            }
+        }
+        if (bestCount == 0)
+        {
+            float bestV = _vOutput[0];
+            winner = 0;
+            for (int i = 1; i < _vOutput.Length; i++)
+            {
+                if (_vOutput[i] > bestV)
+                {
+                    bestV = _vOutput[i];
+                    winner = i;
+                }
+            }
+        }
+        return winner;
+    }
+
+    private void EncodeInput(ReadOnlySpan<float> input)
+    {
+        if (Config.UseRateCoding)
+        {
+            for (int i = 0; i < input.Length; i++)
+            {
+                float p = input[i] * Config.InputRateScale;
+                _inputSpikes[i] = _rng.NextDouble() < p;
+            }
+        }
+        else
+        {
+            float thr = Config.SpikeThreshold;
+            for (int i = 0; i < input.Length; i++)
+            {
+                _inputSpikes[i] = input[i] > thr;
+            }
+        }
+
+        // 输入迹衰减并写入当前脉冲
+        float traceDecay = Config.TraceDecay;
+        for (int i = 0; i < _inputTrace.Length; i++)
+        {
+            _inputTrace[i] = _inputTrace[i] * traceDecay + (_inputSpikes[i] ? 1f : 0f);
+        }
+    }
+
+    private void UpdateHidden(bool learn)
+    {
+        Array.Clear(_hiddenSpikes, 0, _hiddenSpikes.Length);
+        _candidates.Clear();
+
+        float decay = Config.HiddenDecay;
+
+        // GPU / CPU 并行：计算所有隐藏神经元的加权输入脉冲和
+        _gpu.ComputeHiddenWeightedSum(_inputSpikes, _hiddenInput);
+
+        for (int h = 0; h < Config.HiddenSize; h++)
+        {
+            if (_refHidden[h] > 0)
+            {
+                _refHidden[h]--;
+                _vHidden[h] = Config.ResetPotential;
+                continue;
+            }
+
+            // 膜电位 = 衰减后的旧电位 + GPU/并行计算的突触输入
+            float v = _vHidden[h] * decay + _hiddenInput[h];
+            _vHidden[h] = v;
+
+            // 使用自适应阈值（自稳态内在可塑性）
+            if (v >= _thrHidden[h])
+            {
+                _candidates.Add((v, h));
+            }
+        }
+
+        // 侧抑制：仅保留 top-K（生物学：抑制性中间神经元网络）
+        if (_candidates.Count > 0)
+        {
+            int keep = Math.Min(Config.HiddenMaxSpikesPerStep, _candidates.Count);
+            _candidates.Sort((a, b) => b.v.CompareTo(a.v));
+            for (int i = 0; i < keep; i++)
+            {
+                int h = _candidates[i].idx;
+                _hiddenSpikes[h] = true;
+                _hiddenSpikeCount[h]++;
+                _vHidden[h] = Config.ResetPotential;
+                _refHidden[h] = Config.HiddenRefractory;
+
+                if (learn)
+                {
+                    ApplyHiddenStdp(h);
+                }
+            }
+            // STDP 修改了权重，标记 GPU 需要同步（下个样本开始时）
+            if (learn) _weightsDirty = true;
+        }
+
+        // 更新隐藏迹
+        float traceDecay = Config.TraceDecay;
+        for (int h = 0; h < _hiddenTrace.Length; h++)
+        {
+            _hiddenTrace[h] = _hiddenTrace[h] * traceDecay + (_hiddenSpikes[h] ? 1f : 0f);
+        }
+    }
+
+    private void ApplyHiddenStdp(int h)
+    {
+        int baseIdx = h * _hFanIn;
+        float lrLtp = Config.HiddenLtpLearningRate;
+        float lrLtd = Config.HiddenLtdLearningRate;
+        float clamp = Config.WeightClamp;
+
+        for (int k = 0; k < _hFanIn; k++)
+        {
+            float pre = _inputTrace[_hiddenIn[baseIdx + k]]; // 近似 STDP：前迹越大，LTP 越强
+            float dw = lrLtp * pre - lrLtd * (1f - pre);
+            float w = _hiddenW[baseIdx + k] + dw;
+            if (w > clamp) w = clamp;
+            if (w < 0f) w = 0f; // Dale 定律：兴奋性突触非负
+            _hiddenW[baseIdx + k] = w;
+        }
+    }
+
+    private void UpdateOutput(bool learn)
+    {
+        Array.Clear(_outputSpikes, 0, _outputSpikes.Length);
+        _candidates.Clear();
+
+        float decay = Config.OutputDecay;
+        float thr = Config.OutputThreshold;
+
+        for (int o = 0; o < Config.OutputSize; o++)
+        {
+            if (_refOutput[o] > 0)
+            {
+                _refOutput[o]--;
+                _vOutput[o] = Config.ResetPotential;
+                continue;
+            }
+
+            float v = _vOutput[o] * decay;
+            int baseIdx = o * _oFanIn;
+            for (int k = 0; k < _oFanIn; k++)
+            {
+                if (_hiddenSpikes[_outputIn[baseIdx + k]]) v += _outputW[baseIdx + k];
+            }
+            _vOutput[o] = v;
+            if (v >= thr)
+            {
+                _candidates.Add((v, o));
+            }
+        }
+
+        if (_candidates.Count > 0)
+        {
+            int keep = Math.Min(Config.OutputMaxSpikesPerStep, _candidates.Count);
+            _candidates.Sort((a, b) => b.v.CompareTo(a.v));
+            for (int i = 0; i < keep; i++)
+            {
+                int o = _candidates[i].idx;
+                _outputSpikes[o] = true;
+                _outputSpikeCount[o]++;
+                _vOutput[o] = Config.ResetPotential;
+                _refOutput[o] = Config.OutputRefractory;
+
+                if (learn)
+                {
+                    UpdateEligibility(o);
+                }
+            }
+        }
+
+        // 资格迹衰减（整个平坦数组）
+        if (learn)
+        {
+            float decayElig = Config.EligibilityDecay;
+            for (int i = 0; i < _outputElig.Length; i++)
+            {
+                _outputElig[i] *= decayElig;
+            }
+        }
+    }
+
+    private void UpdateEligibility(int o)
+    {
+        int baseIdx = o * _oFanIn;
+        for (int k = 0; k < _oFanIn; k++)
+        {
+            if (_hiddenSpikes[_outputIn[baseIdx + k]])
+            {
+                _outputElig[baseIdx + k] += 1f;
+            }
+        }
+    }
+
+    private void ApplyReward(float reward)
+    {
+        float lr = Config.OutputLearningRate;
+        float clamp = Config.WeightClamp;
+
+        for (int o = 0; o < Config.OutputSize; o++)
+        {
+            int baseIdx = o * _oFanIn;
+            for (int k = 0; k < _oFanIn; k++)
+            {
+                float w = _outputW[baseIdx + k] + lr * reward * _outputElig[baseIdx + k];
+                if (w > clamp) w = clamp;
+                if (w < 0f) w = 0f; // Dale 定律：兴奋性突触非负
+                _outputW[baseIdx + k] = w;
+            }
+        }
+    }
+
+    private void ScaleAll()
+    {
+        float target = Config.SynapticScaleTarget;
+        if (target <= 0f) return;
+
+        for (int h = 0; h < Config.HiddenSize; h++)
+        {
+            ScaleRow(_hiddenW, h * _hFanIn, _hFanIn, target);
+        }
+        for (int o = 0; o < Config.OutputSize; o++)
+        {
+            ScaleRow(_outputW, o * _oFanIn, _oFanIn, target);
+        }
+        _weightsDirty = true;
+    }
+
+    /// <summary>重置所有神经元运行时状态（样本间调用）。</summary>
+    private void ResetState()
+    {
+        Array.Clear(_vHidden);
+        Array.Clear(_vOutput);
+        Array.Clear(_refHidden);
+        Array.Clear(_refOutput);
+        Array.Clear(_inputSpikes);
+        Array.Clear(_hiddenSpikes);
+        Array.Clear(_outputSpikes);
+        Array.Clear(_inputTrace);
+        Array.Clear(_hiddenTrace);
+        Array.Clear(_hiddenSpikeCount);
+        Array.Clear(_outputSpikeCount);
+    }
+
+    /// <summary>清除输出层资格迹（奖励施加后调用，避免跨样本污染）。</summary>
+    private void ClearEligibility()
+    {
+        Array.Clear(_outputElig);
+    }
+
+    /// <summary>
+    /// 自稳态内在可塑性：根据运行平均发放率调节隐藏层每个细胞的阈值。
+    /// 过于活跃的细胞升高阈值（抑制），过于沉默的细胞降低阈值（兴奋）。
+    /// 生物学基础：离子通道密度通过基因表达动态调节（Desai 等 1999）。
+    /// 自由能原理：维持内部表征的多样性以最小化长期预测惊讶。
+    /// </summary>
+    private void UpdateHomeostasis()
+    {
+        float decay = Config.HomeostasisDecay;
+        float oneMinusDecay = 1f - decay;
+        float lr = Config.HomeostasisRate;
+        float target = Config.TargetFiringRate;
+        int ts = Config.TimeSteps;
+        float thrMin = Config.ThresholdMin;
+        float thrMax = Config.ThresholdMax;
+
+        for (int h = 0; h < Config.HiddenSize; h++)
+        {
+            float rate = (float)_hiddenSpikeCount[h] / ts;
+            _avgRateHidden[h] = decay * _avgRateHidden[h] + oneMinusDecay * rate;
+            // 偏差驱动阈值调整：发放率高于目标 → 阈值升高，低于目标 → 阈值降低
+            _thrHidden[h] += lr * (_avgRateHidden[h] - target);
+            _thrHidden[h] = Math.Clamp(_thrHidden[h], thrMin, thrMax);
+        }
+    }
+
+    private static void ScaleRow(float[] arr, int offset, int length, float target)
+    {
+        ReadOnlySpan<float> roSpan = arr.AsSpan(offset, length);
+        float norm = SimdMath.L2Norm(roSpan);
+        if (norm > target && norm > 1e-6f)
+        {
+            float scale = target / norm;
+            Span<float> span = arr.AsSpan(offset, length);
+            SimdMath.ScaleInPlace(span, scale);
+        }
+    }
+
+    private static float[] InitWeights(int fanIn, Random rng)
+    {
+        float[] w = new float[fanIn];
+        // 非负初始化（Dale 定律：兴奋性突触权重 ≥ 0）
+        float s = 1f / MathF.Sqrt(fanIn);
+        for (int i = 0; i < fanIn; i++)
+        {
+            w[i] = (float)rng.NextDouble() * s;
+        }
+        return w;
+    }
+
+    private static int[] SampleUnique(int universe, int count, Random rng)
+    {
+        // 自动限制 count 不超过 universe
+        count = Math.Min(count, universe);
+        if (count <= 0) return [];
+
+        // 小规模用栈分配，大规模用堆分配
+        if (universe <= 2048)
+        {
+            Span<int> pool = stackalloc int[universe];
+            for (int i = 0; i < universe; i++) pool[i] = i;
+            for (int i = 0; i < count; i++)
+            {
+                int j = rng.Next(i, universe);
+                (pool[i], pool[j]) = (pool[j], pool[i]);
+            }
+            int[] result = new int[count];
+            for (int i = 0; i < count; i++) result[i] = pool[i];
+            return result;
+        }
+        else
+        {
+            int[] pool = new int[universe];
+            for (int i = 0; i < universe; i++) pool[i] = i;
+            for (int i = 0; i < count; i++)
+            {
+                int j = rng.Next(i, universe);
+                (pool[i], pool[j]) = (pool[j], pool[i]);
+            }
+            int[] result = new int[count];
+            Array.Copy(pool, result, count);
+            return result;
+        }
+    }
 
     public void Dispose()
     {
-        if (!_disposed)
-        {
-            _hiddenLayer.Dispose();
-            _outputLayer.Dispose();
-            _inputEncoded.Dispose();
-            _hiddenPotential.Dispose();
-            _hiddenAct.Dispose();
-            _outputPotential.Dispose();
-            _avgActivity.Dispose();
-            _disposed = true;
-        }
+        _gpu.Dispose();
     }
 }
