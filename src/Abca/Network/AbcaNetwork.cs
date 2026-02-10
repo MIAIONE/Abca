@@ -200,9 +200,8 @@ public sealed class AbcaNetwork : IDisposable
         int pred = SimulateSample(input, learn: true);
         bool correct = pred == label;
 
-        // 奖励调制：三因子规则的全局多巴胺信号
-        float reward = correct ? Config.RewardPositive : Config.RewardNegative;
-        ApplyReward(reward);
+        // 奖励调制：三因子规则 + 小脑攀爬纤维教学信号
+        ApplyReward(pred, label, correct);
 
         // 施加奖励后清除资格迹（避免跨样本污染）
         ClearEligibility();
@@ -465,20 +464,52 @@ public sealed class AbcaNetwork : IDisposable
         }
     }
 
-    private void ApplyReward(float reward)
+    /// <summary>
+    /// 奖励调制学习：结合多巴胺信号（全局奖励）和小脑教学信号。
+    /// 正确时：多巴胺爆发 → LTP（强化获胜神经元的资格迹加权连接）
+    /// 错误时：多巴胺低谷 → 轻度 LTD（弱化错误获胜者）
+    ///          + 教学信号 → LTP（直接强化正确类别与活跃隐藏神经元的连接）
+    /// 生物学基础：纹状体 D1/D2 受体通路 + 小脑攀爬纤维误差修正。
+    /// </summary>
+    private void ApplyReward(int prediction, int correctLabel, bool correct)
     {
         float lr = Config.OutputLearningRate;
         float clamp = Config.WeightClamp;
 
-        for (int o = 0; o < Config.OutputSize; o++)
+        if (correct)
         {
-            int baseIdx = o * _oFanIn;
+            // 多巴胺爆发：强化获胜神经元的资格迹加权连接（D1 受体 LTP）
+            int baseIdx = prediction * _oFanIn;
             for (int k = 0; k < _oFanIn; k++)
             {
-                float w = _outputW[baseIdx + k] + lr * reward * _outputElig[baseIdx + k];
-                if (w > clamp) w = clamp;
-                if (w < 0f) w = 0f; // Dale 定律：兴奋性突触非负
-                _outputW[baseIdx + k] = w;
+                float w = _outputW[baseIdx + k] + lr * _outputElig[baseIdx + k];
+                _outputW[baseIdx + k] = Math.Clamp(w, 0f, clamp);
+            }
+        }
+        else
+        {
+            // 多巴胺低谷：轻度弱化错误获胜者（D2 受体 LTD，强度为 LTP 的0.3×）
+            float ltdLr = lr * 0.3f;
+            int wrongBase = prediction * _oFanIn;
+            for (int k = 0; k < _oFanIn; k++)
+            {
+                float w = _outputW[wrongBase + k] - ltdLr * _outputElig[wrongBase + k];
+                _outputW[wrongBase + k] = Math.Clamp(w, 0f, clamp);
+            }
+
+            // 小脑教学信号：直接强化正确类别与活跃隐藏神经元的连接
+            // 生物学：攀爬纤维提供精确的误差修正信号（Marr-Albus 理论）
+            int correctBase = correctLabel * _oFanIn;
+            int ts = Config.TimeSteps;
+            for (int k = 0; k < _oFanIn; k++)
+            {
+                int hiddenIdx = _outputIn[correctBase + k];
+                if (_hiddenSpikeCount[hiddenIdx] > 0)
+                {
+                    float activity = (float)_hiddenSpikeCount[hiddenIdx] / ts;
+                    float w = _outputW[correctBase + k] + lr * activity;
+                    _outputW[correctBase + k] = Math.Clamp(w, 0f, clamp);
+                }
             }
         }
     }

@@ -18,3 +18,4 @@ D:\work\Code\ActorModelNetwork\samples\MnistDemo\obj\Release\net10.0\MnistDemo.p
 D:\work\Code\ActorModelNetwork\samples\MnistDemo\obj\Release\net10.0\MnistDemo.genruntimeconfig.cache
 D:\work\Code\ActorModelNetwork\samples\MnistDemo\obj\Release\net10.0\ref\MnistDemo.dll
 D:\work\Code\ActorModelNetwork\samples\MnistDemo\bin\Release\net10.0\ILGPU.dll
+D:\work\Code\ActorModelNetwork\samples\MnistDemo\obj\Release\net10.0\MnistDemo.sourcelink.json

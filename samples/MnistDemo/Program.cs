@@ -185,13 +185,3 @@ static int GetArgInt(string[] args, string name, int defaultValue)
     }
     return defaultValue;
 }
-
-static float GetArgFloat(string[] args, string name, float defaultValue)
-{
-    for (int i = 0; i < args.Length - 1; i++)
-    {
-        if (args[i] == name && float.TryParse(args[i + 1], out float val))
-            return val;
-    }
-    return defaultValue;
-}
