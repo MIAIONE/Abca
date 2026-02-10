@@ -46,8 +46,11 @@ public static class CompetitiveLearning
     /// <summary>
     /// Updates weight rows for cells that were active (activity > 0).
     /// For each active cell j:
-    ///   W[j] ← (1 - η) × W[j] + η × input
-    /// This moves the weight vector toward the input pattern.
+    ///   W[j] ← (1 - η·a) × W[j] + η·a × input
+    /// where a = normalized activity of cell j (activity-dependent plasticity).
+    /// Bio-rationale: Stronger post-synaptic activation causes larger Ca²⁺
+    /// influx through NMDA receptors, enabling more LTP. This is the 
+    /// biological basis of activity-dependent plasticity.
     /// </summary>
     /// <param name="weights">Weight matrix [numCells, inputSize].</param>
     /// <param name="input">The input vector (binary spikes or continuous).</param>
@@ -61,18 +64,33 @@ public static class CompetitiveLearning
         float learningRate)
     {
         int numCells = weights.Rows;
-        float oneMinusLr = 1f - learningRate;
+
+        // Find max activity for normalization (bio: relative activation matters)
+        float maxAct = 0f;
+        for (int j = 0; j < numCells; j++)
+        {
+            if (activity[j] > maxAct) maxAct = activity[j];
+        }
+        if (maxAct < 1e-12f) return; // No active cells
+        float invMax = 1f / maxAct;
 
         for (int j = 0; j < numCells; j++)
         {
             if (activity[j] <= 0f) continue; // Only winners learn
 
+            // Activity-dependent plasticity: lr scales with normalized activity
+            // Bio: Ca²⁺ concentration ∝ firing rate → more LTP at higher rates
+            float normalizedAct = activity[j] * invMax; // [0, 1]
+            float effectiveLr = learningRate * normalizedAct;
+            float oneMinusLr = 1f - effectiveLr;
+
             Span<float> wRow = weights.GetRow(j);
 
-            // W = (1-lr) × W + lr × input  (SIMD vectorized)
-            // Bio: receptive field moves toward correlated input pattern
+            // W = (1-lr·a) × W + lr·a × input  (SIMD vectorized)
+            // Bio: receptive field moves toward correlated input pattern,
+            // proportional to the cell's activation strength
             TensorPrimitives.Multiply((ReadOnlySpan<float>)wRow, oneMinusLr, wRow);
-            SimdMath.AddScaled(wRow, input, learningRate);
+            SimdMath.AddScaled(wRow, input, effectiveLr);
         }
     }
 }
@@ -110,42 +128,91 @@ public static class RewardModulatedHebbian
     /// <param name="prediction">The winning output cell index.</param>
     /// <param name="correctLabel">The correct class label.</param>
     /// <param name="learningRate">Reward-modulated learning rate.</param>
+    /// <summary>LTP/LTD asymmetry ratio. Bio: D1-receptor mediated LTP
+    /// is ~1.5× stronger than D2-receptor mediated LTD in striatal
+    /// medium spiny neurons (Shen et al. 2008).</summary>
+    private const float LtpLtdRatio = 1.5f;
+
+    /// <summary>
+    /// Updates output weights using the enhanced three-factor rule with
+    /// margin-based competitor suppression.
+    /// </summary>
+    /// <param name="weights">Output weight matrix [outputSize, hiddenSize].</param>
+    /// <param name="bias">Output bias vector.</param>
+    /// <param name="hiddenActivity">Post-inhibition hidden cell activities (sparse).</param>
+    /// <param name="outputPotentials">Raw output potentials for all classes.</param>
+    /// <param name="prediction">The winning output cell index.</param>
+    /// <param name="correctLabel">The correct class label.</param>
+    /// <param name="learningRate">Reward-modulated learning rate.</param>
     public static void Update(
         NativeMatrix weights,
         NativeBuffer<float> bias,
         ReadOnlySpan<float> hiddenActivity,
+        ReadOnlySpan<float> outputPotentials,
         int prediction,
         int correctLabel,
         float learningRate)
     {
         Span<float> b = bias.AsSpan();
-        int hiddenSize = weights.Cols;
+        int numClasses = weights.Rows;
 
         if (prediction == correctLabel)
         {
-            // ── Positive reinforcement ─────────────────────────────────
-            // ΔW[winner,j] = +η × hidden[j]  (SIMD vectorized)
-            // Bio: dopamine burst → Hebbian LTP proportional to
-            // pre-synaptic firing rate. Stronger input → larger ΔW.
+            // ── Positive reinforcement (LTP dominant) ──────────────────
+            // ΔW[winner,j] = +η × LTP_ratio × hidden[j]
+            // Bio: dopamine burst via D1 receptors → strong LTP
+            float ltpLr = learningRate * LtpLtdRatio;
             Span<float> winnerRow = weights.GetRow(prediction);
-            SimdMath.AddScaled(winnerRow, hiddenActivity, learningRate);
-            b[prediction] += learningRate * 0.1f;
+            SimdMath.AddScaled(winnerRow, hiddenActivity, ltpLr);
+            b[prediction] += ltpLr * 0.1f;
+
+            // ── Margin reinforcement: suppress close competitors ───────
+            // If any other class has potential close to the winner,
+            // apply mild LTD to that competitor.
+            // Bio: lateral inhibition sharpens category boundaries.
+            float winnerPot = outputPotentials[prediction];
+            float marginLr = learningRate * 0.3f;  // Mild suppression
+            for (int k = 0; k < numClasses; k++)
+            {
+                if (k == correctLabel) continue;
+                // Suppress competitors that are within 80% of winner
+                if (outputPotentials[k] > winnerPot * 0.8f)
+                {
+                    Span<float> compRow = weights.GetRow(k);
+                    SimdMath.AddScaled(compRow, hiddenActivity, -marginLr);
+                    b[k] -= marginLr * 0.1f;
+                }
+            }
         }
         else
         {
-            // ── Punishment + correction ────────────────────────────────
-            // ΔW[wrong,j]   = −η × hidden[j]  (SIMD vectorized)
-            // ΔW[correct,j] = +η × hidden[j]  (SIMD vectorized)
-            // Bio: dopamine dip → LTD at wrong winner proportional to
-            // pre-synaptic rate; teaching signal → LTP at correct cell.
+            // ── Punishment (LTD) + correction (LTP) ────────────────────
+            float ltpLr = learningRate * LtpLtdRatio;
             Span<float> wrongRow = weights.GetRow(prediction);
             Span<float> correctRow = weights.GetRow(correctLabel);
 
-            SimdMath.AddScaled(wrongRow, hiddenActivity, -learningRate);
-            SimdMath.AddScaled(correctRow, hiddenActivity, learningRate);
+            SimdMath.AddScaled(wrongRow, hiddenActivity, -learningRate); // LTD (1×)
+            SimdMath.AddScaled(correctRow, hiddenActivity, ltpLr);       // LTP (1.5×)
 
             b[prediction] -= learningRate * 0.1f;
-            b[correctLabel] += learningRate * 0.1f;
+            b[correctLabel] += ltpLr * 0.1f;
+
+            // ── Suppress other high-activation competitors ─────────────
+            // Bio: when wrong, not just the winner is problematic;
+            // all non-correct neurons with high activation should be
+            // suppressed to sharpen class discrimination.
+            float marginLr = learningRate * 0.2f;
+            float threshold = outputPotentials[prediction] * 0.5f;
+            for (int k = 0; k < numClasses; k++)
+            {
+                if (k == prediction || k == correctLabel) continue;
+                if (outputPotentials[k] > threshold)
+                {
+                    Span<float> compRow = weights.GetRow(k);
+                    SimdMath.AddScaled(compRow, hiddenActivity, -marginLr);
+                    b[k] -= marginLr * 0.1f;
+                }
+            }
         }
     }
 }

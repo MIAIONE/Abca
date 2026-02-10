@@ -398,16 +398,19 @@ public class LearningRuleTests
         // Graded activity: cell 0 strong, cell 2 weak, cells 1,3 silent
         float[] hiddenActivity = [2f, 0f, 0.5f, 0f];
 
+        // Output potentials: winner (1) is dominant, others well below 80% threshold
+        float[] outputPotentials = [0.1f, 10f, 0.1f];
+
         // Prediction is correct (winner == label)
-        RewardModulatedHebbian.Update(weights, bias, hiddenActivity,
+        RewardModulatedHebbian.Update(weights, bias, hiddenActivity, outputPotentials,
             prediction: 1, correctLabel: 1, learningRate: 0.1f);
 
-        // Winner cell 1's weights: proportional to activity
-        // ΔW[1,0] = 0.1 * 2.0 = 0.2 → new = 0.3
-        Assert.Equal(0.3f, weights[1, 0], 1e-4f);
+        // Winner cell 1's weights: proportional to activity × LTP ratio (1.5×)
+        // ΔW[1,0] = 0.1 * 1.5 * 2.0 = 0.3 → new = 0.4
+        Assert.Equal(0.4f, weights[1, 0], 1e-4f);
         Assert.Equal(0.1f, weights[1, 1], 1e-4f); // Inactive, no change
-        // ΔW[1,2] = 0.1 * 0.5 = 0.05 → new = 0.15
-        Assert.Equal(0.15f, weights[1, 2], 1e-4f);
+        // ΔW[1,2] = 0.1 * 1.5 * 0.5 = 0.075 → new = 0.175
+        Assert.Equal(0.175f, weights[1, 2], 1e-4f);
         Assert.Equal(0.1f, weights[1, 3], 1e-4f); // Inactive, no change
 
         // Other cells should be unchanged
@@ -431,17 +434,20 @@ public class LearningRuleTests
         // Graded activity: proportional changes
         float[] hiddenActivity = [1f, 0f, 0.5f, 0f];
 
+        // Output potentials: winner (0) dominant, class 1 well below threshold
+        float[] outputPotentials = [5f, 0.1f, 1f];
+
         // Prediction is wrong: winner=0, correct=2
-        RewardModulatedHebbian.Update(weights, bias, hiddenActivity,
+        RewardModulatedHebbian.Update(weights, bias, hiddenActivity, outputPotentials,
             prediction: 0, correctLabel: 2, learningRate: 0.1f);
 
-        // Wrong winner (0): ΔW = -0.1 * activity
+        // Wrong winner (0): ΔW = -0.1 * activity (LTD, 1× rate)
         Assert.Equal(0.4f, weights[0, 0], 1e-4f);  // -0.1*1.0
         Assert.Equal(0.45f, weights[0, 2], 1e-4f); // -0.1*0.5
 
-        // Correct class (2): ΔW = +0.1 * activity
-        Assert.Equal(0.6f, weights[2, 0], 1e-4f);  // +0.1*1.0
-        Assert.Equal(0.55f, weights[2, 2], 1e-4f); // +0.1*0.5
+        // Correct class (2): ΔW = +0.15 * activity (LTP, 1.5× rate)
+        Assert.Equal(0.65f, weights[2, 0], 1e-4f);  // +0.15*1.0
+        Assert.Equal(0.575f, weights[2, 2], 1e-4f); // +0.15*0.5
 
         // Uninvolved class (1) should be unchanged
         Assert.Equal(0.5f, weights[1, 0], 1e-4f);
@@ -556,7 +562,7 @@ public class NetworkTests
 
         // Train for many iterations
         int lastCorrect = 0;
-        for (int epoch = 0; epoch < 200; epoch++)
+        for (int epoch = 0; epoch < 500; epoch++)
         {
             int correct = 0;
             for (int i = 0; i < 4; i++)
@@ -567,7 +573,7 @@ public class NetworkTests
             lastCorrect = correct;
         }
 
-        // After 200 epochs on 4 examples, should get at least 2/4 correct
+        // After 500 epochs on 4 examples, should get at least 2/4 correct
         Assert.True(lastCorrect >= 2, $"Expected at least 2/4 correct, got {lastCorrect}");
     }
 

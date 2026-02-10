@@ -280,6 +280,7 @@ public sealed class AbcaNetwork : IDisposable
                 _outputLayer.Weights,
                 _outputLayer.Bias,
                 _hiddenAct.AsReadOnlySpan(),
+                _outputPotential.AsReadOnlySpan(),
                 prediction,
                 label,
                 _currentOutputLR);

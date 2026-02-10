@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MnistDemo")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7dc2f654aa3d090e935738b30b392edde4182ce8")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b64f8551d9e690302801b359bceebfab93d89ca2")]
 [assembly: System.Reflection.AssemblyProductAttribute("MnistDemo")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MnistDemo")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
